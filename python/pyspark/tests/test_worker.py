@@ -1,3 +1,4 @@
+# -*- encoding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -19,10 +20,17 @@ import sys
 import tempfile
 import threading
 import time
+import unittest
+has_resource_module = True
+try:
+    import resource
+except ImportError:
+    has_resource_module = False
 
 from py4j.protocol import Py4JJavaError
 
-from pyspark.testing.utils import ReusedPySparkTestCase, QuietTest
+from pyspark import SparkConf, SparkContext
+from pyspark.testing.utils import ReusedPySparkTestCase, PySparkTestCase, QuietTest
 
 if sys.version_info[0] >= 3:
     xrange = range
@@ -144,6 +152,58 @@ class WorkerTests(ReusedPySparkTestCase):
         finally:
             self.sc.pythonVer = version
 
+    def test_python_exception_non_hanging(self):
+        # SPARK-21045: exceptions with no ascii encoding shall not hanging PySpark.
+        try:
+            def f():
+                raise Exception("exception with 中 and \xd6\xd0")
+
+            self.sc.parallelize([1]).map(lambda x: f()).count()
+        except Py4JJavaError as e:
+            if sys.version_info.major < 3:
+                # we have to use unicode here to avoid UnicodeDecodeError
+                self.assertRegexpMatches(unicode(e).encode("utf-8"), "exception with 中")
+            else:
+                self.assertRegexpMatches(str(e), "exception with 中")
+
+
+class WorkerReuseTest(PySparkTestCase):
+
+    def test_reuse_worker_of_parallelize_xrange(self):
+        rdd = self.sc.parallelize(xrange(20), 8)
+        previous_pids = rdd.map(lambda x: os.getpid()).collect()
+        current_pids = rdd.map(lambda x: os.getpid()).collect()
+        for pid in current_pids:
+            self.assertTrue(pid in previous_pids)
+
+
+@unittest.skipIf(
+    not has_resource_module,
+    "Memory limit feature in Python worker is dependent on "
+    "Python's 'resource' module; however, not found.")
+class WorkerMemoryTest(unittest.TestCase):
+
+    def setUp(self):
+        class_name = self.__class__.__name__
+        conf = SparkConf().set("spark.executor.pyspark.memory", "2g")
+        self.sc = SparkContext('local[4]', class_name, conf=conf)
+
+    def test_memory_limit(self):
+        rdd = self.sc.parallelize(xrange(1), 1)
+
+        def getrlimit():
+            import resource
+            return resource.getrlimit(resource.RLIMIT_AS)
+
+        actual = rdd.map(lambda _: getrlimit()).collect()
+        self.assertTrue(len(actual) == 1)
+        self.assertTrue(len(actual[0]) == 2)
+        [(soft_limit, hard_limit)] = actual
+        self.assertEqual(soft_limit, 2 * 1024 * 1024 * 1024)
+        self.assertEqual(hard_limit, 2 * 1024 * 1024 * 1024)
+
+    def tearDown(self):
+        self.sc.stop()
 
 if __name__ == "__main__":
     import unittest
@@ -151,7 +211,7 @@ if __name__ == "__main__":
 
     try:
         import xmlrunner
-        testRunner = xmlrunner.XMLTestRunner(output='target/test-reports')
+        testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
     except ImportError:
         testRunner = None
     unittest.main(testRunner=testRunner, verbosity=2)
